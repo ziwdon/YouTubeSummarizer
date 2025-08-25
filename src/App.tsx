@@ -10,26 +10,18 @@ type ApiResponse = {
 
 const API_BASE = import.meta.env.VITE_API_BASE || '/api'
 
-function extractYouTubeVideoId(input: string): string | null {
+function isSupportedVideoUrl(input: string): boolean {
   try {
-    const url = new URL(input)
-    if (url.hostname.includes('youtube.com')) {
-      if (url.pathname.startsWith('/watch')) {
-        return url.searchParams.get('v')
-      }
-      const embedMatch = url.pathname.match(/\/embed\/([a-zA-Z0-9_-]{11})/)
-      if (embedMatch) return embedMatch[1]
-      const shortsMatch = url.pathname.match(/\/shorts\/([a-zA-Z0-9_-]{11})/)
-      if (shortsMatch) return shortsMatch[1]
-    }
-    if (url.hostname === 'youtu.be') {
-      const id = url.pathname.split('/').filter(Boolean)[0]
-      if (id && /^[a-zA-Z0-9_-]{11}$/.test(id)) return id
-    }
+    const u = new URL(input)
+    const host = u.hostname.toLowerCase()
+    if (host.includes('youtube.com') || host === 'youtu.be') return true
+    if (host.includes('tiktok.com')) return true
+    if (host.includes('instagram.com')) return true
+    return false
   } catch {
-    if (/^[a-zA-Z0-9_-]{11}$/.test(input)) return input
+    // allow bare YouTube IDs
+    return /^[a-zA-Z0-9_-]{11}$/.test(input)
   }
-  return null
 }
 
 function App() {
@@ -38,14 +30,14 @@ function App() {
   const [error, setError] = useState<string | null>(null)
   const [data, setData] = useState<ApiResponse | null>(null)
 
-  const isValid = useMemo(() => !!extractYouTubeVideoId(url), [url])
+  const isValid = useMemo(() => !!isSupportedVideoUrl(url), [url])
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault()
     setError(null)
     setData(null)
     if (!isValid) {
-      setError('Please enter a valid YouTube URL')
+      setError('Please enter a supported video URL (YouTube, TikTok, Instagram)')
       return
     }
     setIsSubmitting(true)
@@ -80,13 +72,13 @@ function App() {
     <div className="container">
       <header>
         <h1>YouTube Summarizer</h1>
-        <p className="subtitle">Paste a YouTube link, get a concise summary with timestamps.</p>
+        <p className="subtitle">Paste a YouTube, TikTok, or Instagram link, get a concise summary with timestamps.</p>
       </header>
 
       <form onSubmit={handleSubmit} className="form">
         <input
           type="url"
-          placeholder="https://www.youtube.com/watch?v=..."
+          placeholder="Paste a video URL (YouTube, TikTok, Instagram)"
           value={url}
           onChange={(e) => setUrl(e.target.value)}
           className={`input ${url && !isValid ? 'input-error' : ''}`}
@@ -96,7 +88,7 @@ function App() {
           {isSubmitting ? 'Summarizing…' : 'Summarize it'}
         </button>
       </form>
-      {url && !isValid && <p className="helper error">Enter a valid YouTube link</p>}
+      {url && !isValid && <p className="helper error">Enter a supported video link (YouTube, TikTok, Instagram)</p>}
       {error && <div className="alert error">{error}</div>}
 
       {data && (

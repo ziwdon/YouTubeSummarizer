@@ -1,6 +1,6 @@
 {
   "GEMINI_API_KEY": "your-gemini-api-key-here",
-  "YOUTUBE_API_KEY": ""
+  "SUPADATA_API_KEY": "your-supadata-api-key-here"
 }
 
 

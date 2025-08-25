@@ -1,39 +1,27 @@
 import type { Handler } from "@netlify/functions";
-import { YoutubeTranscript } from "youtube-transcript";
-import ytdl from "ytdl-core";
 import { GoogleGenerativeAI } from "@google/generative-ai";
-import fs from "node:fs";
-import path from "node:path";
+import fetch from "node-fetch";
 
-type TranscriptItem = {
+type SupadataChunk = {
   text: string;
-  duration: number; // seconds
-  offset: number; // seconds from start
+  offset: number; // milliseconds
+  duration: number; // milliseconds
+  lang: string;
 };
 
-function extractYouTubeVideoId(input: string): string | null {
-  try {
-    const url = new URL(input);
-    if (url.hostname.includes("youtube.com")) {
-      if (url.pathname.startsWith("/watch")) {
-        return url.searchParams.get("v");
-      }
-      const embedMatch = url.pathname.match(/\/embed\/([a-zA-Z0-9_-]{11})/);
-      if (embedMatch) return embedMatch[1];
-      const shortsMatch = url.pathname.match(/\/shorts\/([a-zA-Z0-9_-]{11})/);
-      if (shortsMatch) return shortsMatch[1];
-    }
-    if (url.hostname === "youtu.be") {
-      const id = url.pathname.split("/").filter(Boolean)[0];
-      if (id && /^[a-zA-Z0-9_-]{11}$/.test(id)) return id;
-    }
-  } catch {
-    // not a URL
-    const directIdMatch = input.match(/^[a-zA-Z0-9_-]{11}$/);
-    if (directIdMatch) return directIdMatch[0];
-  }
-  return null;
-}
+type SupadataImmediate = {
+  content: SupadataChunk[];
+  lang: string;
+  availableLangs?: string[];
+};
+
+type SupadataJobStatus = {
+  status: "queued" | "active" | "completed" | "failed";
+  content?: SupadataChunk[] | string;
+  lang?: string;
+  availableLangs?: string[];
+  error?: unknown;
+};
 
 function formatTimestamp(totalSeconds: number): string {
   const seconds = Math.max(0, Math.floor(totalSeconds));
@@ -41,24 +29,101 @@ function formatTimestamp(totalSeconds: number): string {
   const m = Math.floor((seconds % 3600) / 60);
   const s = seconds % 60;
   if (h > 0) {
-    return `${h}:${m.toString().padStart(2, "0")}:${s
-      .toString()
-      .padStart(2, "0")}`;
+    return `${h}:${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
   }
   return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
-function readLocalFunctionConfig(): Record<string, string> | null {
-  try {
-    const localPath = path.join(__dirname, "config.local.json");
-    if (fs.existsSync(localPath)) {
-      const raw = fs.readFileSync(localPath, "utf-8");
-      return JSON.parse(raw);
-    }
-  } catch {
-    // ignore
+// Lightweight env accessor without Node types
+declare const process: any;
+
+function isSupportedVideoUrl(input: string): boolean {
+  const supported = /^(?:https?:\/\/)?(?:www\.)?(?:youtube\.com|youtu\.be|tiktok\.com|instagram\.com)\//i;
+  if (supported.test(input)) return true;
+  // Allow bare YouTube IDs
+  return /^[a-zA-Z0-9_-]{11}$/.test(input);
+}
+
+async function requestSupadata(
+  videoUrl: string,
+  apiKey: string,
+  opts?: { lang?: string; text?: boolean; mode?: "auto" | "native" | "generate" }
+): Promise<SupadataImmediate | { jobId: string }> {
+  let url = `https://api.supadata.ai/v1/transcript?url=${encodeURIComponent(videoUrl)}&text=${String(opts?.text ?? false)}&mode=${encodeURIComponent(opts?.mode ?? "auto")}`;
+  if (opts?.lang) url += `&lang=${encodeURIComponent(opts.lang)}`;
+
+  const res = await fetch(url, { headers: { "x-api-key": apiKey } });
+  if (res.status === 200) {
+    const json = (await res.json()) as SupadataImmediate;
+    return json;
   }
-  return null;
+  if (res.status === 202) {
+    const json = (await res.json()) as { jobId: string };
+    return json;
+  }
+  const errText = await res.text();
+  throw new Error(`Supadata transcript request failed (${res.status}): ${errText}`);
+}
+
+async function pollSupadataJob(
+  jobId: string,
+  apiKey: string,
+  timeoutMs = 60_000,
+  intervalMs = 1_500
+): Promise<SupadataImmediate> {
+  const endpoint = `https://api.supadata.ai/v1/transcript/${jobId}`;
+  const started = Date.now();
+  let lastStatus = "";
+  while (Date.now() - started < timeoutMs) {
+    const res = await fetch(endpoint, { headers: { "x-api-key": apiKey } });
+    if (!res.ok) {
+      const t = await res.text();
+      throw new Error(`Supadata job polling failed (${res.status}): ${t}`);
+    }
+    const json = (await res.json()) as SupadataJobStatus;
+    lastStatus = json.status;
+    if (json.status === "completed") {
+      if (Array.isArray(json.content)) {
+        return { content: json.content as SupadataChunk[], lang: json.lang || "en", availableLangs: json.availableLangs };
+      } else {
+        const textContent = typeof json.content === "string" ? json.content : "";
+        return { content: [{ text: textContent, offset: 0, duration: 0, lang: json.lang || "en" }], lang: json.lang || "en", availableLangs: json.availableLangs };
+      }
+    }
+    if (json.status === "failed") {
+      throw new Error(`Supadata job failed: ${JSON.stringify(json.error || {})}`);
+    }
+    await new Promise((r) => (globalThis as any).setTimeout(r, intervalMs));
+  }
+  throw new Error(`Supadata job polling timed out (last status: ${lastStatus || "unknown"})`);
+}
+
+async function getTranscriptPreferringEnglish(
+  videoUrl: string,
+  apiKey: string
+): Promise<{ items: SupadataChunk[]; lang: string; availableLangs: string[] }> {
+  const first = await requestSupadata(videoUrl, apiKey, { text: false, mode: "auto" });
+  let immediate: SupadataImmediate;
+  if ("jobId" in first) {
+    immediate = await pollSupadataJob(first.jobId, apiKey);
+  } else {
+    immediate = first as SupadataImmediate;
+  }
+
+  if (immediate.lang !== "en" && (immediate.availableLangs || []).includes("en")) {
+    const enReq = await requestSupadata(videoUrl, apiKey, { lang: "en", text: false, mode: "auto" });
+    immediate = "jobId" in enReq ? await pollSupadataJob((enReq as any).jobId, apiKey) : (enReq as SupadataImmediate);
+  }
+
+  return { items: immediate.content, lang: immediate.lang, availableLangs: immediate.availableLangs || [] };
+}
+
+function extractYouTubeVideoIdOptional(input: string): string | null {
+  // youtu.be/VIDEOID or youtube.com/watch?v=VIDEOID or /embed/VIDEOID or /shorts/VIDEOID
+  const directId = input.match(/^[a-zA-Z0-9_-]{11}$/)?.[0];
+  if (directId) return directId;
+  const idFromUrl = input.match(/(?:v=|\/embed\/|\/shorts\/|youtu\.be\/)([a-zA-Z0-9_-]{11})/);
+  return idFromUrl ? idFromUrl[1] : null;
 }
 
 const handler: Handler = async (event) => {
@@ -70,10 +135,10 @@ const handler: Handler = async (event) => {
     };
   }
 
-  let url: string | undefined;
+  let srcUrl: string | undefined;
   try {
     const body = event.body ? JSON.parse(event.body) : {};
-    url = body.url;
+    srcUrl = body.url;
   } catch {
     return {
       statusCode: 400,
@@ -82,7 +147,7 @@ const handler: Handler = async (event) => {
     };
   }
 
-  if (!url || typeof url !== "string") {
+  if (!srcUrl || typeof srcUrl !== "string") {
     return {
       statusCode: 400,
       headers: { "Content-Type": "application/json" },
@@ -90,18 +155,26 @@ const handler: Handler = async (event) => {
     };
   }
 
-  const videoId = extractYouTubeVideoId(url);
-  if (!videoId) {
+  if (!isSupportedVideoUrl(srcUrl)) {
     return {
       statusCode: 400,
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ error: "Please provide a valid YouTube URL" }),
+      body: JSON.stringify({ error: "Please provide a supported video URL (YouTube, TikTok, Instagram)" }),
     };
   }
 
-  // Load API keys from env or local function config
-  const localConfig = readLocalFunctionConfig();
-  const geminiApiKey = process.env.GEMINI_API_KEY || localConfig?.GEMINI_API_KEY;
+  const supadataApiKey = process?.env?.SUPADATA_API_KEY;
+  if (!supadataApiKey) {
+    return {
+      statusCode: 500,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        error:
+          "Missing SUPADATA_API_KEY. Set it as a Netlify environment variable or in netlify/functions/config.local.json",
+      }),
+    };
+  }
+  const geminiApiKey = process?.env?.GEMINI_API_KEY;
   if (!geminiApiKey) {
     return {
       statusCode: 500,
@@ -113,64 +186,37 @@ const handler: Handler = async (event) => {
     };
   }
 
-  let transcript: TranscriptItem[] = [];
-  // Try robust captionTracks-based approach first
   try {
-    transcript = await fetchTranscriptViaCaptionTracks(videoId);
-  } catch {
-    // Fallback to youtube-transcript library
-    try {
-      const items = await YoutubeTranscript.fetchTranscript(videoId);
-      transcript = items.map((i) => ({
-        text: i.text,
-        duration: Number(i.duration) || 0,
-        offset: Number(i.offset) || 0,
-      }));
-    } catch (e: any) {
-      const message =
-        e && typeof e.message === "string" ? e.message : "Failed to fetch transcript";
-      const notFound = /transcript/i.test(message) || /not found/i.test(message);
+    let requestUrl = srcUrl;
+    if (/^[a-zA-Z0-9_-]{11}$/.test(srcUrl)) {
+      requestUrl = `https://youtu.be/${srcUrl}`;
+    }
+    const { items } = await getTranscriptPreferringEnglish(requestUrl, supadataApiKey);
+    if (!items?.length) {
       return {
-        statusCode: notFound ? 404 : 500,
+        statusCode: 404,
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          error:
-            notFound
-              ? "No transcript available for this video. It may be disabled or unavailable."
-              : `Error fetching transcript: ${message}`,
-        }),
+        body: JSON.stringify({ error: "No transcript found for this video." }),
       };
     }
-  }
 
-  if (!transcript.length) {
-    return {
-      statusCode: 404,
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        error: "No transcript found for this video.",
-      }),
-    };
-  }
+    const transcriptText = items
+      .map((it) => {
+        const seconds = Math.floor((Number(it.offset) || 0) / 1000);
+        return `[${formatTimestamp(seconds)}] ${it.text}`;
+      })
+      .join("\n");
 
-  const transcriptText = transcript
-    .map((t) => `[${formatTimestamp(t.offset)}] ${t.text}`)
-    .join("\n");
+    const MAX_CHARS = 180_000;
+    const truncated = transcriptText.length > MAX_CHARS;
+    const transcriptForModel = truncated ? transcriptText.slice(0, MAX_CHARS) : transcriptText;
 
-  // Prevent excessive prompt size; Gemini 2.0 Flash handles long contexts but keep conservative
-  const MAX_CHARS = 180_000;
-  const truncated = transcriptText.length > MAX_CHARS;
-  const transcriptForModel = truncated
-    ? transcriptText.slice(0, MAX_CHARS)
-    : transcriptText;
-
-  const genAI = new GoogleGenerativeAI(geminiApiKey);
-  const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
-
-  const systemInstruction = `You are an expert at creating concise, structured summaries of YouTube videos from transcripts.
+    const genAI = new GoogleGenerativeAI(geminiApiKey);
+    const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
+    const systemInstruction = `You are an expert at creating concise, structured summaries of videos from transcripts.
 Return a highly readable, well-structured summary containing:
 - A one-paragraph overview of the video.
-- 5-10 bullet key takeaways. Each takeaway must include one or more timestamps in [mm:ss] or [h:mm:ss] format referencing the transcript moments.
+- 5-10 bullet key takeaways. Each takeaway should include one or more timestamps in [mm:ss] or [h:mm:ss] format referencing the transcript moments.
 - A short timeline section highlighting 6-12 notable moments with their timestamps.
 
 Guidelines:
@@ -179,11 +225,10 @@ Guidelines:
 - If content is truncated, mention that the summary may be incomplete.
 - Do not fabricate timestamps; use ones present in the transcript text provided.`;
 
-  const userInstruction = truncated
-    ? "The transcript was truncated due to length. Summarize the provided portion faithfully."
-    : "Summarize the transcript faithfully.";
+    const userInstruction = truncated
+      ? "The transcript was truncated due to length. Summarize the provided portion faithfully."
+      : "Summarize the transcript faithfully.";
 
-  try {
     const result = await model.generateContent([
       { text: systemInstruction },
       { text: userInstruction },
@@ -192,130 +237,26 @@ Guidelines:
     const response = await result.response;
     const summary = response.text();
 
+    const maybeVideoId = extractYouTubeVideoIdOptional(srcUrl) || "";
+
     return {
       statusCode: 200,
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        videoId,
+        videoId: maybeVideoId,
         summary,
         transcript: transcriptText,
         truncated,
       }),
     };
   } catch (e: any) {
-    const message = e?.message || "Failed to generate summary";
+    const message = e?.message || "Failed to process transcript";
     return {
       statusCode: 500,
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ error: `Gemini summarization error: ${message}` }),
+      body: JSON.stringify({ error: message }),
     };
   }
 };
 
 export { handler };
-
-async function fetchTranscriptViaCaptionTracks(videoId: string): Promise<TranscriptItem[]> {
-  const info = await ytdl.getInfo(videoId);
-  // ytdl has player_response (legacy) and playerResponse (new) shapes
-  const pr: any = (info as any).player_response || (info as any).playerResponse;
-  const tracklist = pr?.captions?.playerCaptionsTracklistRenderer;
-  const captionTracks: any[] = tracklist?.captionTracks || [];
-  const automaticCaptions: any[] = tracklist?.automaticCaptions || [];
-  const audioTracks: any[] = tracklist?.audioTracks || [];
-  const audioCaptionTracks: any[] = Array.isArray(audioTracks)
-    ? audioTracks.flatMap((t: any) => t?.captionTracks || [])
-    : [];
-  const tracks: any[] = [...captionTracks, ...automaticCaptions, ...audioCaptionTracks];
-  if (!tracks.length) {
-    throw new Error("No caption tracks found");
-  }
-
-  const preferred = selectBestTrack(tracks);
-  const items = await downloadTrackAsJson3(preferred);
-  if (items.length) return items;
-
-  // Fallback to VTT if JSON3 blocked
-  const vttItems = await downloadTrackAsVtt(preferred);
-  if (vttItems.length) return vttItems;
-
-  throw new Error("Failed to parse caption track");
-}
-
-function selectBestTrack(tracks: any[]): any {
-  const byLang = (code: string) => tracks.find((t) => (t.languageCode || t.language) === code);
-  const enNonAsr = tracks.find((t) => ((t.languageCode || "").startsWith("en") || (t.language || "").startsWith("en")) && !t.kind);
-  if (enNonAsr) return enNonAsr;
-  const enAny = tracks.find((t) => ((t.languageCode || "").startsWith("en") || (t.language || "").startsWith("en")));
-  if (enAny) return enAny;
-  return tracks[0];
-}
-
-async function downloadTrackAsJson3(track: any): Promise<TranscriptItem[]> {
-  const urlObj = new URL(track.baseUrl);
-  urlObj.searchParams.set("fmt", "json3");
-  const res = await fetch(urlObj.toString(), { headers: { "accept-language": "en,en-US;q=0.9" } });
-  if (!res.ok) throw new Error(`JSON3 fetch failed: ${res.status}`);
-  const data = await res.json();
-  const events = data?.events as any[] | undefined;
-  if (!events || !Array.isArray(events)) return [];
-  const out: TranscriptItem[] = [];
-  for (const ev of events) {
-    const startMs = Number(ev.tStartMs ?? 0);
-    const durMs = Number(ev.dDurationMs ?? 0);
-    const segs = ev.segs as Array<{ utf8: string }> | undefined;
-    if (!segs || !segs.length) continue;
-    const text = segs.map((s) => s.utf8).join("").replace(/\s+/g, " ").trim();
-    if (!text) continue;
-    out.push({ text, offset: startMs / 1000, duration: durMs / 1000 });
-  }
-  return out;
-}
-
-function parseVttTime(s: string): number {
-  // Supports mm:ss.mmm or hh:mm:ss.mmm
-  const parts = s.split(":");
-  let h = 0, m = 0, sec = 0;
-  if (parts.length === 3) {
-    h = Number(parts[0]);
-    m = Number(parts[1]);
-    sec = Number(parts[2].replace(",", "."));
-  } else if (parts.length === 2) {
-    m = Number(parts[0]);
-    sec = Number(parts[1].replace(",", "."));
-  }
-  return h * 3600 + m * 60 + sec;
-}
-
-async function downloadTrackAsVtt(track: any): Promise<TranscriptItem[]> {
-  const urlObj = new URL(track.baseUrl);
-  urlObj.searchParams.set("fmt", "vtt");
-  const res = await fetch(urlObj.toString(), { headers: { "accept-language": "en,en-US;q=0.9" } });
-  if (!res.ok) throw new Error(`VTT fetch failed: ${res.status}`);
-  const text = await res.text();
-  const lines = text.split(/\r?\n/);
-  const out: TranscriptItem[] = [];
-  let i = 0;
-  while (i < lines.length) {
-    const line = lines[i].trim();
-    const ts = line.match(/^(\d{1,2}:\d{2}:\d{2}\.\d{3}|\d{1,2}:\d{2}\.\d{3})\s+-->\s+(\d{1,2}:\d{2}:\d{2}\.\d{3}|\d{1,2}:\d{2}\.\d{3})/);
-    if (ts) {
-      const start = parseVttTime(ts[1]);
-      const end = parseVttTime(ts[2]);
-      const buf: string[] = [];
-      i++;
-      while (i < lines.length && lines[i].trim() !== "") {
-        buf.push(lines[i]);
-        i++;
-      }
-      const txt = buf.join(" ").replace(/\s+/g, " ").trim();
-      if (txt) out.push({ text: txt, offset: start, duration: Math.max(0, end - start) });
-    } else {
-      i++;
-    }
-    // skip blank line
-    while (i < lines.length && lines[i].trim() === "") i++;
-  }
-  return out;
-}
-
-

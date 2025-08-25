@@ -1,9 +1,9 @@
 # YouTube Summarizer
 
-React + TypeScript app that fetches a YouTube video's transcript and summarizes it with Gemini (model: `gemini-2.0-flash`). Built with Vite and a Netlify Function.
+React + TypeScript app that fetches a video's transcript (YouTube, TikTok, Instagram) using Supadata and summarizes it with Gemini (model: `gemini-2.0-flash`). Built with Vite and a Netlify Function.
 
 ## Features
-- Paste a YouTube link, validation included
+- Paste a YouTube/TikTok/Instagram link, validation included
 - Handles missing transcripts and invalid links gracefully
 - Summaries with readable structure and timestamps
 - Copy buttons for summary and full transcript
@@ -16,6 +16,7 @@ npm install
 ```
 2. Configure environment:
    - Set `GEMINI_API_KEY` (Netlify env var), or create `netlify/functions/config.local.json` from `netlify/functions/config.example.json`.
+   - Set `SUPADATA_API_KEY` (Netlify env var) for transcript retrieval via Supadata.
    - Optionally set `VITE_API_BASE` (defaults to `/api`).
 3. Run locally with Netlify dev (proxies functions):
 ```bash
@@ -31,7 +32,9 @@ npm run dev
 - Publish directory: `dist`
 - Set environment variables in Netlify dashboard:
   - `GEMINI_API_KEY`
+  - `SUPADATA_API_KEY`
 
 ## Notes
 - Some videos have no transcripts; the app informs the user.
 - Very long transcripts are truncated before summarization for responsiveness.
+- Transcripts are fetched from Supadata (`mode=auto`) and will be in the video's default language, preferring English when available.
