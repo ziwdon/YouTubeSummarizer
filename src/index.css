@@ -4,7 +4,7 @@
   font-weight: 400;
 
   color-scheme: light dark;
-  color: rgba(255, 255, 255, 0.92);
+  color: rgba(255, 255, 255, 0.96);
   background-color: #0f0f0f;
 
   font-synthesis: none;
@@ -12,6 +12,8 @@
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
+
+*, *::before, *::after { box-sizing: border-box; }
 
 a {
   font-weight: 600;
@@ -29,6 +31,8 @@ body {
   min-width: 320px;
   min-height: 100vh;
 }
+
+h1, h2, h3, h4, h5, h6 { color: #ffffff; }
 
 h1 {
   font-size: 3.2em;
