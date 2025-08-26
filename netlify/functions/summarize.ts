@@ -54,8 +54,18 @@ async function requestSupadata(
 
   const res = await fetch(url, { headers: { "x-api-key": apiKey } });
   if (res.status === 200) {
-    const json = (await res.json()) as SupadataImmediate;
-    return json;
+    const json = (await res.json()) as any;
+    // Normalize: Supadata may occasionally return a string content even when text=false
+    if (json && typeof json === "object" && json.content && !Array.isArray(json.content) && typeof json.content === "string") {
+      return {
+        content: [
+          { text: String(json.content), offset: 0, duration: 0, lang: json.lang || "en" },
+        ],
+        lang: json.lang || "en",
+        availableLangs: json.availableLangs || [],
+      } as SupadataImmediate;
+    }
+    return json as SupadataImmediate;
   }
   if (res.status === 202) {
     const json = (await res.json()) as { jobId: string };
@@ -78,6 +88,7 @@ async function pollSupadataJob(
     const res = await fetch(endpoint, { headers: { "x-api-key": apiKey } });
     if (!res.ok) {
       const t = await res.text();
+      console.error("Supadata job polling HTTP error", { jobId, status: res.status, text: t });
       throw new Error(`Supadata job polling failed (${res.status}): ${t}`);
     }
     const json = (await res.json()) as SupadataJobStatus;
@@ -91,31 +102,91 @@ async function pollSupadataJob(
       }
     }
     if (json.status === "failed") {
+      console.error("Supadata job failed", { jobId, error: json.error });
       throw new Error(`Supadata job failed: ${JSON.stringify(json.error || {})}`);
     }
     await new Promise((r) => (globalThis as any).setTimeout(r, intervalMs));
   }
+  console.error("Supadata job polling timed out", { jobId, lastStatus: lastStatus || "unknown" });
   throw new Error(`Supadata job polling timed out (last status: ${lastStatus || "unknown"})`);
 }
 
-async function getTranscriptPreferringEnglish(
+type TranscriptAttemptRecord = {
+  mode: "auto" | "native" | "generate";
+  lang?: string;
+  outcome: "ok" | "job" | "empty" | "error";
+  itemCount?: number;
+  returnedLang?: string;
+  availableLangs?: string[];
+  contentKind?: "chunks" | "text";
+  errorMessage?: string;
+};
+
+async function getTranscriptWithFallbacks(
   videoUrl: string,
-  apiKey: string
+  apiKey: string,
+  opts?: { preferEnglish?: boolean; forceMode?: "auto" | "native" | "generate"; debugAttempts?: TranscriptAttemptRecord[] }
 ): Promise<{ items: SupadataChunk[]; lang: string; availableLangs: string[] }> {
-  const first = await requestSupadata(videoUrl, apiKey, { text: false, mode: "auto" });
-  let immediate: SupadataImmediate;
-  if ("jobId" in first) {
-    immediate = await pollSupadataJob(first.jobId, apiKey);
-  } else {
-    immediate = first as SupadataImmediate;
+  const preferEnglish = opts?.preferEnglish !== false;
+  const attempts = opts?.debugAttempts;
+
+  async function perform(mode: "auto" | "native" | "generate", lang?: string) {
+    try {
+      const first = await requestSupadata(videoUrl, apiKey, { text: false, mode, lang });
+      let immediate: SupadataImmediate;
+      if ("jobId" in first) {
+        attempts?.push({ mode, lang, outcome: "job" });
+        immediate = await pollSupadataJob(first.jobId, apiKey);
+      } else {
+        immediate = first as SupadataImmediate;
+      }
+      const contentKind: "chunks" | "text" = Array.isArray(immediate.content) ? "chunks" : "text";
+      const items = Array.isArray(immediate.content)
+        ? (immediate.content as SupadataChunk[])
+        : ([{ text: String((immediate as any).content || ""), offset: 0, duration: 0, lang: immediate.lang || "en" }] as SupadataChunk[]);
+      attempts?.push({
+        mode,
+        lang,
+        outcome: items.length ? "ok" : "empty",
+        itemCount: items.length,
+        returnedLang: immediate.lang,
+        availableLangs: immediate.availableLangs,
+        contentKind,
+      });
+      return { items, lang: immediate.lang, availableLangs: immediate.availableLangs || [] };
+    } catch (e: any) {
+      attempts?.push({ mode, lang, outcome: "error", errorMessage: e?.message || String(e) });
+      throw e;
+    }
   }
 
-  if (immediate.lang !== "en" && (immediate.availableLangs || []).includes("en")) {
-    const enReq = await requestSupadata(videoUrl, apiKey, { lang: "en", text: false, mode: "auto" });
-    immediate = "jobId" in enReq ? await pollSupadataJob((enReq as any).jobId, apiKey) : (enReq as SupadataImmediate);
+  // Start with preferred or forced mode
+  const initialMode = opts?.forceMode || "auto";
+  let result = await perform(initialMode);
+
+  // If not English but English available and preferred, try English explicitly
+  if (preferEnglish && result.lang !== "en" && (result.availableLangs || []).includes("en")) {
+    const enRes = await perform(initialMode, "en");
+    if (enRes.items.length) {
+      result = enRes;
+    }
   }
 
-  return { items: immediate.content, lang: immediate.lang, availableLangs: immediate.availableLangs || [] };
+  // If still empty, try native then generate
+  if (!result.items.length && initialMode !== "native") {
+    try {
+      const nativeRes = await perform("native");
+      if (nativeRes.items.length) result = nativeRes;
+    } catch {}
+  }
+  if (!result.items.length && initialMode !== "generate") {
+    try {
+      const genRes = await perform("generate");
+      if (genRes.items.length) result = genRes;
+    } catch {}
+  }
+
+  return result;
 }
 
 function extractYouTubeVideoIdOptional(input: string): string | null {
@@ -136,9 +207,15 @@ const handler: Handler = async (event) => {
   }
 
   let srcUrl: string | undefined;
+  let debugFlag = false;
+  let forceMode: "auto" | "native" | "generate" | undefined;
   try {
     const body = event.body ? JSON.parse(event.body) : {};
     srcUrl = body.url;
+    debugFlag = Boolean(body.debug);
+    if (body.mode === "auto" || body.mode === "native" || body.mode === "generate") {
+      forceMode = body.mode;
+    }
   } catch {
     return {
       statusCode: 400,
@@ -191,12 +268,21 @@ const handler: Handler = async (event) => {
     if (/^[a-zA-Z0-9_-]{11}$/.test(srcUrl)) {
       requestUrl = `https://youtu.be/${srcUrl}`;
     }
-    const { items } = await getTranscriptPreferringEnglish(requestUrl, supadataApiKey);
+    const debugAttempts: TranscriptAttemptRecord[] = [];
+    const { items, lang, availableLangs } = await getTranscriptWithFallbacks(requestUrl, supadataApiKey, {
+      preferEnglish: true,
+      forceMode,
+      debugAttempts,
+    });
     if (!items?.length) {
+      console.warn("No transcript found", { url: requestUrl, debugAttempts, lang, availableLangs });
       return {
         statusCode: 404,
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ error: "No transcript found for this video." }),
+        body: JSON.stringify({
+          error: "No transcript found for this video.",
+          ...(debugFlag ? { debug: { attempts: debugAttempts, finalLang: lang, availableLangs } } : {}),
+        }),
       };
     }
 
@@ -216,7 +302,7 @@ const handler: Handler = async (event) => {
     const systemInstruction = `You are an expert at creating concise, structured summaries of videos from transcripts.
 Return a highly readable, well-structured summary containing:
 - A one-paragraph overview of the video.
-- 5-10 bullet key takeaways. Each takeaway should include one or more timestamps in [mm:ss] or [h:mm:ss] format referencing the transcript moments.
+- 5-10 bullet key takeaways. Each takeaway should include the start and end timestamp as a reference to the transcript (in [mm:ss] or [h:mm:ss] format).
 
 Guidelines:
 - Use clear headings and bullet points.
@@ -246,10 +332,12 @@ Guidelines:
         summary,
         transcript: transcriptText,
         truncated,
+        ...(debugFlag ? { debug: { attempts: debugAttempts, finalLang: lang, availableLangs } } : {}),
       }),
     };
   } catch (e: any) {
     const message = e?.message || "Failed to process transcript";
+    console.error("summarize error", { url: srcUrl, message, error: e });
     return {
       statusCode: 500,
       headers: { "Content-Type": "application/json" },
