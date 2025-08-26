@@ -217,7 +217,6 @@ const handler: Handler = async (event) => {
 Return a highly readable, well-structured summary containing:
 - A one-paragraph overview of the video.
 - 5-10 bullet key takeaways. Each takeaway should include one or more timestamps in [mm:ss] or [h:mm:ss] format referencing the transcript moments.
-- A short timeline section highlighting 6-12 notable moments with their timestamps.
 
 Guidelines:
 - Use clear headings and bullet points.
