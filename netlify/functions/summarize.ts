@@ -302,7 +302,7 @@ const handler: Handler = async (event) => {
     const systemInstruction = `You are an expert at creating concise, structured summaries of videos from transcripts.
 Return a highly readable, well-structured summary containing:
 - A one-paragraph overview of the video.
-- 5-10 bullet key takeaways. Each takeaway should include the start and end timestamp as a reference to the transcript (in [mm:ss] or [h:mm:ss] format).
+- 5-10 bullet key takeaways. Each takeaway must include the start timestamp from the transcript in [mm:ss] or [h:mm:ss] format (e.g. [02:15], [1:02:15]).
 
 Guidelines:
 - Use clear headings and bullet points.

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useState, useRef } from 'react'
 import './App.css'
 
 type ApiResponse = {
@@ -31,6 +31,7 @@ function App() {
   const [data, setData] = useState<ApiResponse | null>(null)
   const [canShare, setCanShare] = useState(false)
   const [loadingStepIndex, setLoadingStepIndex] = useState(0)
+  const inputRef = useRef<HTMLInputElement>(null)
 
   const LOADING_STEPS = useMemo(
     () => [
@@ -41,6 +42,15 @@ function App() {
     ],
     []
   )
+
+  function resetAll() {
+    setUrl('')
+    setData(null)
+    setError(null)
+    setIsSubmitting(false)
+    try { window.scrollTo({ top: 0, behavior: 'smooth' }) } catch {}
+    setTimeout(() => inputRef.current?.focus(), 50)
+  }
 
   useEffect(() => {
     setCanShare(Boolean((navigator as any)?.share))
@@ -108,12 +118,13 @@ function App() {
   return (
     <div className="container">
       <header>
-        <h1 className="brand"><span className="yt-accent">▶</span> YouTube Summarizer</h1>
+        <h1 className="brand as-link" onClick={resetAll} role="button" tabIndex={0} onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') resetAll() }}><span className="yt-accent">▶</span> YouTube Summarizer</h1>
         <p className="subtitle">Paste a YouTube, TikTok, or Instagram link to get a concise summary.</p>
       </header>
 
       <form onSubmit={handleSubmit} className="form">
         <input
+          ref={inputRef}
           type="url"
           placeholder="Paste a video URL (YouTube, TikTok, Instagram)"
           value={url}
@@ -150,7 +161,7 @@ function App() {
           {data.truncated && (
             <div className="alert warn">Transcript was long; summary is based on a truncated portion.</div>
           )}
-          <div className="panel">
+          <div className="panel panel-light">
             <div className="panel-header">
               <h2>Summary</h2>
               <div className="actions">
