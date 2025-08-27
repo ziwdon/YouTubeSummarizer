@@ -302,10 +302,11 @@ const handler: Handler = async (event) => {
     const systemInstruction = `You are an expert at creating concise, structured summaries of videos from transcripts.
 Return a highly readable, well-structured summary containing:
 - A one-paragraph overview of the video.
-- 5-10 bullet key takeaways. Each takeaway must include a concise title (<=10 words) and the start timestamp from the transcript in [mm:ss] or [h:mm:ss] format (e.g. [02:15], [1:02:15]).
+- A detailed summary of the video.
+- 5-10 bullet key takeaways. Each takeaway must include a concise title (<=10 words), 1-2 sentence description, and the start timestamp from the transcript in [mm:ss] or [h:mm:ss] format (e.g. [02:15], [1:02:15]).
 
 Guidelines:
-- Use clear headings and bullet points.
+- Use clear headings, formatting, and bullet points.
 - Maintain the video's original terminology where helpful.
 - If content is truncated, mention that the summary may be incomplete.
 - Do not fabricate timestamps; use ones present in the transcript text provided.`;

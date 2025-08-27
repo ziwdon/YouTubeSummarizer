@@ -163,7 +163,15 @@ function App() {
           )}
           <div className="panel panel-light share-wrap">
             {canShare && (
-              <button className="share-icon" aria-label="Share with AI" title="Share with AI" onClick={shareWithAI}>🔗</button>
+              <button
+                className="share-icon"
+                aria-label="Share with AI"
+                title="Share with AI"
+                onClick={shareWithAI}
+                style={{ fontSize: '1.1rem', width: 32, height: 32, lineHeight: '32px', padding: 0 }}
+              >
+                🔗
+              </button>
             )}
             <div className="panel-header">
               <h2>Summary</h2>
