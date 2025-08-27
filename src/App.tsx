@@ -161,15 +161,15 @@ function App() {
           {data.truncated && (
             <div className="alert warn">Transcript was long; summary is based on a truncated portion.</div>
           )}
-          <div className="panel panel-light">
+          <div className="panel panel-light share-wrap">
+            {canShare && (
+              <button className="share-icon" aria-label="Share with AI" title="Share with AI" onClick={shareWithAI}>🔗</button>
+            )}
             <div className="panel-header">
               <h2>Summary</h2>
               <div className="actions">
                 <button className="ghost" onClick={() => copy(data.summary)}>📋 Copy Summary</button>
                 <button className="ghost" onClick={() => copy(data.transcript)}>🧾 Copy Transcript</button>
-                {canShare && (
-                  <button className="ghost" onClick={shareWithAI}>🤖 Share with AI</button>
-                )}
               </div>
             </div>
             <article className="content" dangerouslySetInnerHTML={{ __html: renderRichSummary(data.summary) }} />
