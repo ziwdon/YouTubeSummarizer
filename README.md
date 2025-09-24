@@ -1,5 +1,7 @@
 # YouTube Summarizer
 
+<p align="center"><img width="547" height="215" alt="image" src="https://github.com/user-attachments/assets/a69cde07-ccfe-41a8-af6a-7c7655029e73" /></p>
+
 React + TypeScript app that fetches a video's transcript (YouTube, TikTok, Instagram) using Supadata and summarizes it with Gemini (model: `gemini-2.0-flash`). Built with Vite and a Netlify Function.
 
 ## Features
