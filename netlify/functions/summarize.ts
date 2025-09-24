@@ -190,11 +190,115 @@ async function getTranscriptWithFallbacks(
 }
 
 function extractYouTubeVideoIdOptional(input: string): string | null {
-  // youtu.be/VIDEOID or youtube.com/watch?v=VIDEOID or /embed/VIDEOID or /shorts/VIDEOID
-  const directId = input.match(/^[a-zA-Z0-9_-]{11}$/)?.[0];
-  if (directId) return directId;
-  const idFromUrl = input.match(/(?:v=|\/embed\/|\/shorts\/|youtu\.be\/)([a-zA-Z0-9_-]{11})/);
-  return idFromUrl ? idFromUrl[1] : null;
+  if (!input) return null;
+
+  const trimmed = input.trim();
+  if (!trimmed) return null;
+
+  const idPattern = /^[a-zA-Z0-9_-]{11}$/;
+
+  if (idPattern.test(trimmed)) {
+    return trimmed;
+  }
+
+  const candidates = new Set<string>();
+
+  const addCandidate = (value: string | null | undefined) => {
+    if (value && idPattern.test(value)) {
+      candidates.add(value);
+    }
+  };
+
+  const visited = new Set<string>();
+
+  const normalizeForUrl = (raw: string) => {
+    const value = raw.trim();
+    if (!value) return value;
+
+    if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(value)) {
+      return value;
+    }
+    if (value.startsWith("//")) {
+      return `https:${value}`;
+    }
+    if (value.startsWith("/")) {
+      return `https://youtube.com${value}`;
+    }
+    return `https://${value}`;
+  };
+
+  const parseUrl = (raw: string, depth = 0) => {
+    if (!raw || depth > 3 || visited.has(raw)) return;
+    visited.add(raw);
+
+    let url: URL;
+    try {
+      url = new URL(normalizeForUrl(raw));
+    } catch {
+      return;
+    }
+
+    const host = url.hostname.toLowerCase();
+    const isYouTubeHost =
+      host === "youtu.be" ||
+      host === "www.youtu.be" ||
+      host === "youtube.com" ||
+      host === "www.youtube.com" ||
+      host.endsWith(".youtube.com") ||
+      host === "youtube-nocookie.com" ||
+      host.endsWith(".youtube-nocookie.com");
+
+    const pathSegments = url.pathname.split("/").filter(Boolean);
+
+    if (host.includes("youtu.be")) {
+      addCandidate(pathSegments[0]);
+    }
+
+    if (isYouTubeHost) {
+      if (pathSegments.length >= 2) {
+        const [first, second] = pathSegments;
+        if (["embed", "shorts", "live", "v"].includes(first)) {
+          addCandidate(second);
+        }
+      } else if (pathSegments.length === 1 && host !== "youtube.com") {
+        addCandidate(pathSegments[0]);
+      }
+
+      ["v", "vi", "video_id"].forEach((key) => addCandidate(url.searchParams.get(key)));
+    }
+
+    ["url", "u", "q"].forEach((key) => {
+      const nested = url.searchParams.get(key);
+      if (nested) {
+        parseUrl(decodeURIComponent(nested), depth + 1);
+      }
+    });
+
+    const combined = `${url.pathname}${url.search}${url.hash}`;
+    const pattern = /(?:v=|vi=|video_id=|\/videos\/|\/embed\/|\/shorts\/|\/v\/|\/live\/|\/watch\/|youtu\.be\/)([a-zA-Z0-9_-]{11})/g;
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(combined))) {
+      addCandidate(match[1]);
+    }
+  };
+
+  parseUrl(trimmed);
+
+  if (candidates.size) {
+    return candidates.values().next().value ?? null;
+  }
+
+  if (/youtu/i.test(trimmed)) {
+    const fallbackMatch = trimmed.match(/([a-zA-Z0-9_-]{11})/);
+    if (fallbackMatch) {
+      const [candidate] = fallbackMatch;
+      if (idPattern.test(candidate)) {
+        return candidate;
+      }
+    }
+  }
+
+  return null;
 }
 
 const handler: Handler = async (event) => {

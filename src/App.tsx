@@ -105,10 +105,10 @@ function App() {
 
   async function shareWithAI() {
     try {
-      if (!canShare) return
+      if (!canShare || !data?.transcript) return
       const shareData: any = {
-        title: 'Video summary',
-        text: data?.summary ? stripHtml(renderRichSummary(data.summary)) : 'Check out this video summary',
+        title: 'Video transcript',
+        text: data.transcript,
       }
       if (url) (shareData as any).url = url
       await (navigator as any).share(shareData)
