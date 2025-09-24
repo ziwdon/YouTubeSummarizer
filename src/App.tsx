@@ -242,10 +242,4 @@ function renderRichSummary(text: string): string {
   return ulWrapped
 }
 
-function stripHtml(html: string): string {
-  const tmp = document.createElement('div')
-  tmp.innerHTML = html
-  return tmp.textContent || tmp.innerText || ''
-}
-
 export default App
