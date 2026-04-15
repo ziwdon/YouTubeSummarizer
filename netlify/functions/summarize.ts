@@ -10,7 +10,7 @@ type SupadataChunk = {
 };
 
 type SupadataImmediate = {
-  content: SupadataChunk[];
+  content: SupadataChunk[] | string;
   lang: string;
   availableLangs?: string[];
 };
@@ -22,6 +22,22 @@ type SupadataJobStatus = {
   availableLangs?: string[];
   error?: unknown;
 };
+
+type SupadataResponsePayload = {
+  content?: unknown;
+  lang?: string;
+  availableLangs?: string[];
+};
+
+function getErrorMessage(error: unknown, fallback: string): string {
+  if (error instanceof Error && error.message) {
+    return error.message;
+  }
+  if (typeof error === "string" && error) {
+    return error;
+  }
+  return fallback;
+}
 
 function formatTimestamp(totalSeconds: number): string {
   const seconds = Math.max(0, Math.floor(totalSeconds));
@@ -51,18 +67,27 @@ async function requestSupadata(
 
   const res = await fetch(url, { headers: { "x-api-key": apiKey } });
   if (res.status === 200) {
-    const json = (await res.json()) as any;
-    // Normalize: Supadata may occasionally return a string content even when text=false
-    if (json && typeof json === "object" && json.content && !Array.isArray(json.content) && typeof json.content === "string") {
+    const payload = (await res.json()) as SupadataResponsePayload;
+    // Normalize: Supadata may occasionally return a string content even when text=false.
+    if (typeof payload.content === "string") {
       return {
-        content: [
-          { text: String(json.content), offset: 0, duration: 0, lang: json.lang || "en" },
-        ],
-        lang: json.lang || "en",
-        availableLangs: json.availableLangs || [],
+        content: payload.content,
+        lang: payload.lang || "en",
+        availableLangs: payload.availableLangs || [],
       } as SupadataImmediate;
     }
-    return json as SupadataImmediate;
+    if (Array.isArray(payload.content)) {
+      return {
+        content: payload.content as SupadataChunk[],
+        lang: payload.lang || "en",
+        availableLangs: payload.availableLangs || [],
+      } as SupadataImmediate;
+    }
+    return {
+      content: [],
+      lang: payload.lang || "en",
+      availableLangs: payload.availableLangs || [],
+    } as SupadataImmediate;
   }
   if (res.status === 202) {
     const json = (await res.json()) as { jobId: string };
@@ -102,7 +127,7 @@ async function pollSupadataJob(
       console.error("Supadata job failed", { jobId, error: json.error });
       throw new Error(`Supadata job failed: ${JSON.stringify(json.error || {})}`);
     }
-    await new Promise((r) => (globalThis as any).setTimeout(r, intervalMs));
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
   }
   console.error("Supadata job polling timed out", { jobId, lastStatus: lastStatus || "unknown" });
   throw new Error(`Supadata job polling timed out (last status: ${lastStatus || "unknown"})`);
@@ -139,8 +164,8 @@ async function getTranscriptWithFallbacks(
       }
       const contentKind: "chunks" | "text" = Array.isArray(immediate.content) ? "chunks" : "text";
       const items = Array.isArray(immediate.content)
-        ? (immediate.content as SupadataChunk[])
-        : ([{ text: String((immediate as any).content || ""), offset: 0, duration: 0, lang: immediate.lang || "en" }] as SupadataChunk[]);
+        ? immediate.content
+        : [{ text: String(immediate.content || ""), offset: 0, duration: 0, lang: immediate.lang || "en" }];
       attempts?.push({
         mode,
         lang,
@@ -151,8 +176,8 @@ async function getTranscriptWithFallbacks(
         contentKind,
       });
       return { items, lang: immediate.lang, availableLangs: immediate.availableLangs || [] };
-    } catch (e: any) {
-      attempts?.push({ mode, lang, outcome: "error", errorMessage: e?.message || String(e) });
+    } catch (e: unknown) {
+      attempts?.push({ mode, lang, outcome: "error", errorMessage: getErrorMessage(e, "Transcript request failed") });
       throw e;
     }
   }
@@ -174,13 +199,17 @@ async function getTranscriptWithFallbacks(
     try {
       const nativeRes = await perform("native");
       if (nativeRes.items.length) result = nativeRes;
-    } catch {}
+    } catch {
+      // Best-effort fallback: continue to "generate" mode.
+    }
   }
   if (!result.items.length && initialMode !== "generate") {
     try {
       const genRes = await perform("generate");
       if (genRes.items.length) result = genRes;
-    } catch {}
+    } catch {
+      // Best-effort fallback: preserve prior result.
+    }
   }
 
   return result;
@@ -440,8 +469,8 @@ Guidelines:
         ...(debugFlag ? { debug: { attempts: debugAttempts, finalLang: lang, availableLangs } } : {}),
       }),
     };
-  } catch (e: any) {
-    const message = e?.message || "Failed to process transcript";
+  } catch (e: unknown) {
+    const message = getErrorMessage(e, "Failed to process transcript");
     console.error("summarize error", { url: srcUrl, message, error: e });
     return {
       statusCode: 500,
