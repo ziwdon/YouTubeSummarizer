@@ -8,6 +8,10 @@ type ApiResponse = {
   truncated?: boolean
 }
 
+type NavigatorWithShare = Navigator & {
+  share: (data?: ShareData) => Promise<void>
+}
+
 const API_BASE = import.meta.env.VITE_API_BASE || '/api'
 
 function isSupportedVideoUrl(input: string): boolean {
@@ -22,6 +26,16 @@ function isSupportedVideoUrl(input: string): boolean {
     // allow bare YouTube IDs
     return /^[a-zA-Z0-9_-]{11}$/.test(input)
   }
+}
+
+function getErrorMessage(error: unknown, fallback: string): string {
+  if (error instanceof Error && error.message) return error.message
+  if (typeof error === 'string' && error) return error
+  return fallback
+}
+
+function supportsWebShare(nav: Navigator): nav is NavigatorWithShare {
+  return typeof (nav as Navigator & { share?: unknown }).share === 'function'
 }
 
 function App() {
@@ -48,12 +62,12 @@ function App() {
     setData(null)
     setError(null)
     setIsSubmitting(false)
-    try { window.scrollTo({ top: 0, behavior: 'smooth' }) } catch {}
+    try { window.scrollTo({ top: 0, behavior: 'smooth' }) } catch { /* Ignore unsupported smooth-scroll contexts. */ }
     setTimeout(() => inputRef.current?.focus(), 50)
   }
 
   useEffect(() => {
-    setCanShare(Boolean((navigator as any)?.share))
+    setCanShare(supportsWebShare(navigator))
   }, [])
 
   useEffect(() => {
@@ -88,8 +102,8 @@ function App() {
       }
       const json: ApiResponse = await res.json()
       setData(json)
-    } catch (err: any) {
-      setError(err?.message || 'Failed to summarize video')
+    } catch (err: unknown) {
+      setError(getErrorMessage(err, 'Failed to summarize video'))
     } finally {
       setIsSubmitting(false)
     }
@@ -100,19 +114,23 @@ function App() {
   async function copy(text: string) {
     try {
       await navigator.clipboard.writeText(text)
-    } catch {}
+    } catch {
+      // Copy failures are non-fatal (e.g., blocked clipboard permissions).
+    }
   }
 
   async function shareWithAI() {
     try {
-      if (!canShare || !data?.transcript) return
-      const shareData: any = {
+      if (!canShare || !data?.transcript || !supportsWebShare(navigator)) return
+      const shareData: ShareData = {
         title: 'Video transcript',
         text: data.transcript,
       }
-      if (url) (shareData as any).url = url
-      await (navigator as any).share(shareData)
-    } catch {}
+      if (url) shareData.url = url
+      await navigator.share(shareData)
+    } catch {
+      // Ignore when user cancels native share sheet or API errors.
+    }
   }
 
   return (
@@ -238,7 +256,7 @@ function renderRichSummary(text: string): string {
   }
   // Wrap consecutive <li> into <ul>
   const joined = html.join('\n')
-  const ulWrapped = joined.replace(/(?:<li>[\s\S]*?<\/li>\n?)+/g, (m) => `<ul class=\"list\">\n${m}\n<\/ul>\n`)
+  const ulWrapped = joined.replace(/(?:<li>[\s\S]*?<\/li>\n?)+/g, (m) => `<ul class="list">\n${m}\n</ul>\n`)
   return ulWrapped
 }
 
