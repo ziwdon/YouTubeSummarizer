@@ -1,5 +1,5 @@
 import type { Handler } from "@netlify/functions";
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import { GoogleGenAI, ThinkingLevel } from "@google/genai";
 import fetch from "node-fetch";
 
 type SupadataChunk = {
@@ -33,9 +33,6 @@ function formatTimestamp(totalSeconds: number): string {
   }
   return `${m}:${s.toString().padStart(2, "0")}`;
 }
-
-// Lightweight env accessor without Node types
-declare const process: any;
 
 function isSupportedVideoUrl(input: string): boolean {
   const supported = /^(?:https?:\/\/)?(?:www\.)?(?:youtube\.com|youtu\.be|tiktok\.com|instagram\.com)\//i;
@@ -401,8 +398,7 @@ const handler: Handler = async (event) => {
     const truncated = transcriptText.length > MAX_CHARS;
     const transcriptForModel = truncated ? transcriptText.slice(0, MAX_CHARS) : transcriptText;
 
-    const genAI = new GoogleGenerativeAI(geminiApiKey);
-    const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
+    const ai = new GoogleGenAI({ apiKey: geminiApiKey });
     const systemInstruction = `You are an expert at creating concise, structured summaries of videos from transcripts.
 Return a highly readable, well-structured summary containing:
 - A one-paragraph overview of the video.
@@ -419,13 +415,17 @@ Guidelines:
       ? "The transcript was truncated due to length. Summarize the provided portion faithfully."
       : "Summarize the transcript faithfully.";
 
-    const result = await model.generateContent([
-      { text: systemInstruction },
-      { text: userInstruction },
-      { text: "\n\nTRANSCRIPT:\n" + transcriptForModel },
-    ]);
-    const response = await result.response;
-    const summary = response.text();
+    const response = await ai.models.generateContent({
+      model: "gemini-3-flash-preview",
+      contents: userInstruction + "\n\nTRANSCRIPT:\n" + transcriptForModel,
+      config: {
+        systemInstruction,
+        thinkingConfig: {
+          thinkingLevel: ThinkingLevel.LOW,
+        },
+      },
+    });
+    const summary = response.text ?? "";
 
     const maybeVideoId = extractYouTubeVideoIdOptional(srcUrl) || "";
 

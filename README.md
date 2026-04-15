@@ -2,7 +2,7 @@
 
 <p align="center"><img width="547" height="215" alt="image" src="https://github.com/user-attachments/assets/a69cde07-ccfe-41a8-af6a-7c7655029e73" /></p>
 
-React + TypeScript app that fetches a video's transcript (YouTube, TikTok, Instagram) using Supadata and summarizes it with Gemini (model: `gemini-2.0-flash`). Built with Vite and a Netlify Function.
+React + TypeScript app that fetches a video's transcript (YouTube, TikTok, Instagram) using Supadata and summarizes it with Gemini (model: `gemini-3-flash-preview`). Built with Vite and a Netlify Function.
 
 ## Features
 - Paste a YouTube/TikTok/Instagram link, validation included
@@ -12,6 +12,8 @@ React + TypeScript app that fetches a video's transcript (YouTube, TikTok, Insta
 - Serverless: API keys are not exposed to the browser
 
 ## Setup
+> **Requires Node.js 20+** (set via `.node-version` or `NODE_VERSION` env var on Netlify).
+
 1. Install dependencies:
 ```bash
 npm install
