@@ -1,5 +1,5 @@
 import type { Handler } from "@netlify/functions";
-import { GoogleGenAI } from "@google/genai";
+import { GoogleGenAI, ThinkingLevel } from "@google/genai";
 import fetch from "node-fetch";
 
 type SupadataChunk = {
@@ -421,7 +421,7 @@ Guidelines:
       config: {
         systemInstruction,
         thinkingConfig: {
-          thinkingLevel: "LOW",
+          thinkingLevel: ThinkingLevel.LOW,
         },
       },
     });
