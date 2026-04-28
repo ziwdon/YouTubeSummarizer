@@ -29,6 +29,81 @@ type SupadataResponsePayload = {
   availableLangs?: string[];
 };
 
+class StageTimeoutError extends Error {
+  stage: string;
+  timeoutMs: number;
+
+  constructor(stage: string, timeoutMs: number) {
+    super(`${stage} timed out after ${timeoutMs}ms`);
+    this.name = "StageTimeoutError";
+    this.stage = stage;
+    this.timeoutMs = timeoutMs;
+  }
+}
+
+class DeadlineExceededError extends Error {
+  stage: string;
+  remainingMs: number;
+
+  constructor(stage: string, remainingMs: number) {
+    super(`${stage} skipped because request deadline was exceeded (${remainingMs}ms remaining)`);
+    this.name = "DeadlineExceededError";
+    this.stage = stage;
+    this.remainingMs = remainingMs;
+  }
+}
+
+function isTimeoutLikeError(error: unknown): error is StageTimeoutError | DeadlineExceededError {
+  return error instanceof StageTimeoutError || error instanceof DeadlineExceededError;
+}
+
+function getEnvPositiveInt(name: string, fallback: number): number {
+  const raw = process?.env?.[name];
+  if (!raw) return fallback;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.floor(parsed);
+}
+
+function getEffectiveTimeoutMs(preferredMs: number, stage: string, deadlineAt?: number): number {
+  if (!deadlineAt) return preferredMs;
+  const remaining = deadlineAt - Date.now();
+  if (remaining <= 500) {
+    throw new DeadlineExceededError(stage, remaining);
+  }
+  return Math.max(750, Math.min(preferredMs, remaining - 250));
+}
+
+async function fetchWithTimeout(url: string, init: Parameters<typeof fetch>[1], timeoutMs: number, stage: string) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...(init || {}), signal: controller.signal });
+  } catch (error: unknown) {
+    if (
+      (error as { name?: string })?.name === "AbortError" ||
+      (error as { code?: string })?.code === "ABORT_ERR"
+    ) {
+      throw new StageTimeoutError(stage, timeoutMs);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function promiseWithTimeout<T>(promise: Promise<T>, timeoutMs: number, stage: string): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const timeoutPromise = new Promise<T>((_, reject) => {
+      timeout = setTimeout(() => reject(new StageTimeoutError(stage, timeoutMs)), timeoutMs);
+    });
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
 function getErrorMessage(error: unknown, fallback: string): string {
   if (error instanceof Error && error.message) {
     return error.message;
@@ -60,12 +135,19 @@ function isSupportedVideoUrl(input: string): boolean {
 async function requestSupadata(
   videoUrl: string,
   apiKey: string,
-  opts?: { lang?: string; text?: boolean; mode?: "auto" | "native" | "generate" }
+  opts?: {
+    lang?: string;
+    text?: boolean;
+    mode?: "auto" | "native" | "generate";
+    requestTimeoutMs?: number;
+    deadlineAt?: number;
+  }
 ): Promise<SupadataImmediate | { jobId: string }> {
   let url = `https://api.supadata.ai/v1/transcript?url=${encodeURIComponent(videoUrl)}&text=${String(opts?.text ?? false)}&mode=${encodeURIComponent(opts?.mode ?? "auto")}`;
   if (opts?.lang) url += `&lang=${encodeURIComponent(opts.lang)}`;
 
-  const res = await fetch(url, { headers: { "x-api-key": apiKey } });
+  const timeoutMs = getEffectiveTimeoutMs(opts?.requestTimeoutMs ?? 9_000, "Supadata transcript request", opts?.deadlineAt);
+  const res = await fetchWithTimeout(url, { headers: { "x-api-key": apiKey } }, timeoutMs, "Supadata transcript request");
   if (res.status === 200) {
     const payload = (await res.json()) as SupadataResponsePayload;
     // Normalize: Supadata may occasionally return a string content even when text=false.
@@ -101,13 +183,24 @@ async function pollSupadataJob(
   jobId: string,
   apiKey: string,
   timeoutMs = 60_000,
-  intervalMs = 1_500
+  intervalMs = 1_500,
+  opts?: { requestTimeoutMs?: number; deadlineAt?: number }
 ): Promise<SupadataImmediate> {
   const endpoint = `https://api.supadata.ai/v1/transcript/${jobId}`;
   const started = Date.now();
   let lastStatus = "";
   while (Date.now() - started < timeoutMs) {
-    const res = await fetch(endpoint, { headers: { "x-api-key": apiKey } });
+    const requestTimeoutMs = getEffectiveTimeoutMs(
+      opts?.requestTimeoutMs ?? 7_000,
+      "Supadata transcript polling",
+      opts?.deadlineAt
+    );
+    const res = await fetchWithTimeout(
+      endpoint,
+      { headers: { "x-api-key": apiKey } },
+      requestTimeoutMs,
+      "Supadata transcript polling"
+    );
     if (!res.ok) {
       const t = await res.text();
       console.error("Supadata job polling HTTP error", { jobId, status: res.status, text: t });
@@ -126,6 +219,14 @@ async function pollSupadataJob(
     if (json.status === "failed") {
       console.error("Supadata job failed", { jobId, error: json.error });
       throw new Error(`Supadata job failed: ${JSON.stringify(json.error || {})}`);
+    }
+    if (opts?.deadlineAt) {
+      const remaining = opts.deadlineAt - Date.now();
+      if (remaining <= 500) {
+        throw new DeadlineExceededError("Supadata transcript polling", remaining);
+      }
+      await new Promise((resolve) => setTimeout(resolve, Math.min(intervalMs, Math.max(250, remaining - 250))));
+      continue;
     }
     await new Promise((resolve) => setTimeout(resolve, intervalMs));
   }
@@ -147,18 +248,32 @@ type TranscriptAttemptRecord = {
 async function getTranscriptWithFallbacks(
   videoUrl: string,
   apiKey: string,
-  opts?: { preferEnglish?: boolean; forceMode?: "auto" | "native" | "generate"; debugAttempts?: TranscriptAttemptRecord[] }
+  opts?: {
+    preferEnglish?: boolean;
+    forceMode?: "auto" | "native" | "generate";
+    debugAttempts?: TranscriptAttemptRecord[];
+    deadlineAt?: number;
+  }
 ): Promise<{ items: SupadataChunk[]; lang: string; availableLangs: string[] }> {
   const preferEnglish = opts?.preferEnglish !== false;
   const attempts = opts?.debugAttempts;
 
   async function perform(mode: "auto" | "native" | "generate", lang?: string) {
     try {
-      const first = await requestSupadata(videoUrl, apiKey, { text: false, mode, lang });
+      const first = await requestSupadata(videoUrl, apiKey, {
+        text: false,
+        mode,
+        lang,
+        requestTimeoutMs: 9_000,
+        deadlineAt: opts?.deadlineAt,
+      });
       let immediate: SupadataImmediate;
       if ("jobId" in first) {
         attempts?.push({ mode, lang, outcome: "job" });
-        immediate = await pollSupadataJob(first.jobId, apiKey);
+        immediate = await pollSupadataJob(first.jobId, apiKey, 60_000, 1_500, {
+          requestTimeoutMs: 7_000,
+          deadlineAt: opts?.deadlineAt,
+        });
       } else {
         immediate = first as SupadataImmediate;
       }
@@ -339,6 +454,9 @@ const handler: Handler = async (event) => {
   let srcUrl: string | undefined;
   let debugFlag = false;
   let forceMode: "auto" | "native" | "generate" | undefined;
+  const requestId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  const overallDeadlineMs = getEnvPositiveInt("SUMMARIZE_DEADLINE_MS", 23_000);
+  const deadlineAt = Date.now() + overallDeadlineMs;
   try {
     const body = event.body ? JSON.parse(event.body) : {};
     srcUrl = body.url;
@@ -394,6 +512,7 @@ const handler: Handler = async (event) => {
   }
 
   try {
+    console.info("summarize request started", { requestId, url: srcUrl, forceMode, overallDeadlineMs, debug: debugFlag });
     let requestUrl = srcUrl;
     if (/^[a-zA-Z0-9_-]{11}$/.test(srcUrl)) {
       requestUrl = `https://youtu.be/${srcUrl}`;
@@ -403,6 +522,7 @@ const handler: Handler = async (event) => {
       preferEnglish: true,
       forceMode,
       debugAttempts,
+      deadlineAt,
     });
     if (!items?.length) {
       console.warn("No transcript found", { url: requestUrl, debugAttempts, lang, availableLangs });
@@ -423,9 +543,14 @@ const handler: Handler = async (event) => {
       })
       .join("\n");
 
-    const MAX_CHARS = 180_000;
-    const truncated = transcriptText.length > MAX_CHARS;
-    const transcriptForModel = truncated ? transcriptText.slice(0, MAX_CHARS) : transcriptText;
+    const maxModelChars = getEnvPositiveInt("MAX_TRANSCRIPT_MODEL_CHARS", 60_000);
+    const maxResponseChars = getEnvPositiveInt("MAX_TRANSCRIPT_RESPONSE_CHARS", 120_000);
+    const truncated = transcriptText.length > maxModelChars;
+    const transcriptForModel = truncated ? transcriptText.slice(0, maxModelChars) : transcriptText;
+    const responseTranscriptTruncated = transcriptText.length > maxResponseChars;
+    const transcriptForResponse = responseTranscriptTruncated
+      ? transcriptText.slice(0, maxResponseChars)
+      : transcriptText;
 
     const ai = new GoogleGenAI({ apiKey: geminiApiKey });
     const systemInstruction = `You are an expert at creating concise, structured summaries of videos from transcripts.
@@ -444,16 +569,33 @@ Guidelines:
       ? "The transcript was truncated due to length. Summarize the provided portion faithfully."
       : "Summarize the transcript faithfully.";
 
-    const response = await ai.models.generateContent({
-      model: "gemini-3-flash-preview",
-      contents: userInstruction + "\n\nTRANSCRIPT:\n" + transcriptForModel,
-      config: {
-        systemInstruction,
-        thinkingConfig: {
-          thinkingLevel: ThinkingLevel.LOW,
-        },
-      },
+    const geminiTimeoutMs = getEffectiveTimeoutMs(
+      getEnvPositiveInt("GEMINI_TIMEOUT_MS", 12_000),
+      "Gemini summarization",
+      deadlineAt
+    );
+    console.info("summarize transcript ready", {
+      requestId,
+      itemCount: items.length,
+      transcriptLength: transcriptText.length,
+      modelTranscriptLength: transcriptForModel.length,
+      geminiTimeoutMs,
+      responseTranscriptTruncated,
     });
+    const response = await promiseWithTimeout(
+      ai.models.generateContent({
+        model: "gemini-3-flash-preview",
+        contents: userInstruction + "\n\nTRANSCRIPT:\n" + transcriptForModel,
+        config: {
+          systemInstruction,
+          thinkingConfig: {
+            thinkingLevel: ThinkingLevel.LOW,
+          },
+        },
+      }),
+      geminiTimeoutMs,
+      "Gemini summarization"
+    );
     const summary = response.text ?? "";
 
     const maybeVideoId = extractYouTubeVideoIdOptional(srcUrl) || "";
@@ -464,14 +606,26 @@ Guidelines:
       body: JSON.stringify({
         videoId: maybeVideoId,
         summary,
-        transcript: transcriptText,
+        transcript: transcriptForResponse,
         truncated,
+        responseTranscriptTruncated,
         ...(debugFlag ? { debug: { attempts: debugAttempts, finalLang: lang, availableLangs } } : {}),
       }),
     };
   } catch (e: unknown) {
     const message = getErrorMessage(e, "Failed to process transcript");
-    console.error("summarize error", { url: srcUrl, message, error: e });
+    if (isTimeoutLikeError(e)) {
+      console.error("summarize timeout", { requestId, url: srcUrl, message, error: e });
+      return {
+        statusCode: 504,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          error: "Summarization timed out before completion. Try a shorter video or try again in a moment.",
+          ...(debugFlag ? { detail: message } : {}),
+        }),
+      };
+    }
+    console.error("summarize error", { requestId, url: srcUrl, message, error: e });
     return {
       statusCode: 500,
       headers: { "Content-Type": "application/json" },
