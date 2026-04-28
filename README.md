@@ -49,8 +49,8 @@ The summarize path is synchronous (`/api/summarize`) and can time out if transcr
 
 This function now supports tuning env vars:
 
-- `SUMMARIZE_DEADLINE_MS` (default `23000`): overall internal deadline before returning a controlled timeout.
-- `GEMINI_TIMEOUT_MS` (default `12000`): max time spent waiting for Gemini response.
+- `SUMMARIZE_DEADLINE_MS` (default `55000`): overall internal deadline before returning a controlled timeout.
+- `GEMINI_TIMEOUT_MS` (default `35000`): max time spent waiting for Gemini response.
 - `MAX_TRANSCRIPT_MODEL_CHARS` (default `60000`): transcript size sent to Gemini.
 - `MAX_TRANSCRIPT_RESPONSE_CHARS` (default `120000`): transcript size returned to the browser.
 
@@ -59,3 +59,13 @@ If you still see 502/504:
 - Try shorter videos first to confirm behavior.
 - Temporarily send `{ "debug": true }` in request body to include transcript-attempt diagnostics in JSON responses.
 - Verify `SUPADATA_API_KEY` and `GEMINI_API_KEY` are present and valid in Netlify environment variables.
+
+### Recommended Netlify values
+
+Netlify synchronous functions currently have a 60s execution limit. To leave a small safety margin, start with:
+
+- `SUMMARIZE_DEADLINE_MS=55000`
+- `GEMINI_TIMEOUT_MS=35000`
+- `MAX_TRANSCRIPT_MODEL_CHARS=60000` (raise to `90000` only if needed)
+
+If timeouts persist, inspect the debug logs first before increasing transcript size caps.

@@ -146,7 +146,7 @@ async function requestSupadata(
   let url = `https://api.supadata.ai/v1/transcript?url=${encodeURIComponent(videoUrl)}&text=${String(opts?.text ?? false)}&mode=${encodeURIComponent(opts?.mode ?? "auto")}`;
   if (opts?.lang) url += `&lang=${encodeURIComponent(opts.lang)}`;
 
-  const timeoutMs = getEffectiveTimeoutMs(opts?.requestTimeoutMs ?? 9_000, "Supadata transcript request", opts?.deadlineAt);
+  const timeoutMs = getEffectiveTimeoutMs(opts?.requestTimeoutMs ?? 12_000, "Supadata transcript request", opts?.deadlineAt);
   const res = await fetchWithTimeout(url, { headers: { "x-api-key": apiKey } }, timeoutMs, "Supadata transcript request");
   if (res.status === 200) {
     const payload = (await res.json()) as SupadataResponsePayload;
@@ -191,7 +191,7 @@ async function pollSupadataJob(
   let lastStatus = "";
   while (Date.now() - started < timeoutMs) {
     const requestTimeoutMs = getEffectiveTimeoutMs(
-      opts?.requestTimeoutMs ?? 7_000,
+      opts?.requestTimeoutMs ?? 10_000,
       "Supadata transcript polling",
       opts?.deadlineAt
     );
@@ -264,14 +264,14 @@ async function getTranscriptWithFallbacks(
         text: false,
         mode,
         lang,
-        requestTimeoutMs: 9_000,
+        requestTimeoutMs: 12_000,
         deadlineAt: opts?.deadlineAt,
       });
       let immediate: SupadataImmediate;
       if ("jobId" in first) {
         attempts?.push({ mode, lang, outcome: "job" });
         immediate = await pollSupadataJob(first.jobId, apiKey, 60_000, 1_500, {
-          requestTimeoutMs: 7_000,
+          requestTimeoutMs: 10_000,
           deadlineAt: opts?.deadlineAt,
         });
       } else {
@@ -455,7 +455,7 @@ const handler: Handler = async (event) => {
   let debugFlag = false;
   let forceMode: "auto" | "native" | "generate" | undefined;
   const requestId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-  const overallDeadlineMs = getEnvPositiveInt("SUMMARIZE_DEADLINE_MS", 23_000);
+  const overallDeadlineMs = getEnvPositiveInt("SUMMARIZE_DEADLINE_MS", 52_000);
   const deadlineAt = Date.now() + overallDeadlineMs;
   try {
     const body = event.body ? JSON.parse(event.body) : {};
@@ -570,7 +570,7 @@ Guidelines:
       : "Summarize the transcript faithfully.";
 
     const geminiTimeoutMs = getEffectiveTimeoutMs(
-      getEnvPositiveInt("GEMINI_TIMEOUT_MS", 12_000),
+      getEnvPositiveInt("GEMINI_TIMEOUT_MS", 35_000),
       "Gemini summarization",
       deadlineAt
     );
