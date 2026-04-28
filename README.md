@@ -42,3 +42,20 @@ npm run dev
 - Some videos have no transcripts; the app informs the user.
 - Very long transcripts are truncated before summarization for responsiveness.
 - Transcripts are fetched from Supadata (`mode=auto`) and will be in the video's default language, preferring English when available.
+
+## Troubleshooting 502/504 on "Summarize"
+
+The summarize path is synchronous (`/api/summarize`) and can time out if transcript retrieval or model inference is slow.
+
+This function now supports tuning env vars:
+
+- `SUMMARIZE_DEADLINE_MS` (default `23000`): overall internal deadline before returning a controlled timeout.
+- `GEMINI_TIMEOUT_MS` (default `12000`): max time spent waiting for Gemini response.
+- `MAX_TRANSCRIPT_MODEL_CHARS` (default `60000`): transcript size sent to Gemini.
+- `MAX_TRANSCRIPT_RESPONSE_CHARS` (default `120000`): transcript size returned to the browser.
+
+If you still see 502/504:
+- Check function logs for `summarize request started`, `summarize transcript ready`, and `summarize timeout` entries.
+- Try shorter videos first to confirm behavior.
+- Temporarily send `{ "debug": true }` in request body to include transcript-attempt diagnostics in JSON responses.
+- Verify `SUPADATA_API_KEY` and `GEMINI_API_KEY` are present and valid in Netlify environment variables.
