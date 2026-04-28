@@ -1,6 +1,11 @@
 {
   "GEMINI_API_KEY": "your-gemini-api-key-here",
-  "SUPADATA_API_KEY": "your-supadata-api-key-here"
+  "SUPADATA_API_KEY": "your-supadata-api-key-here",
+  "SUMMARIZE_DEADLINE_MS": 26000,
+  "GEMINI_TIMEOUT_MS": 18000,
+  "PLATFORM_HARD_TIMEOUT_MS": 30000,
+  "PLATFORM_TIMEOUT_SAFETY_MS": 2500,
+  "SUPADATA_ASYNC_HANDOFF": true
 }
 
 

@@ -29,6 +29,18 @@ type SupadataResponsePayload = {
   availableLangs?: string[];
 };
 
+class SupadataJobPendingError extends Error {
+  jobId: string;
+  status: "queued" | "active";
+
+  constructor(jobId: string, status: "queued" | "active") {
+    super(`Supadata job ${jobId} is still ${status}`);
+    this.name = "SupadataJobPendingError";
+    this.jobId = jobId;
+    this.status = status;
+  }
+}
+
 class StageTimeoutError extends Error {
   stage: string;
   timeoutMs: number;
@@ -114,6 +126,43 @@ function getErrorMessage(error: unknown, fallback: string): string {
   return fallback;
 }
 
+function normalizeSupadataImmediate(payload: SupadataResponsePayload): SupadataImmediate {
+  if (typeof payload.content === "string") {
+    return {
+      content: payload.content,
+      lang: payload.lang || "en",
+      availableLangs: payload.availableLangs || [],
+    };
+  }
+  if (Array.isArray(payload.content)) {
+    return {
+      content: payload.content as SupadataChunk[],
+      lang: payload.lang || "en",
+      availableLangs: payload.availableLangs || [],
+    };
+  }
+  return {
+    content: [],
+    lang: payload.lang || "en",
+    availableLangs: payload.availableLangs || [],
+  };
+}
+
+function normalizeSupadataItems(immediate: SupadataImmediate): {
+  items: SupadataChunk[];
+  lang: string;
+  availableLangs: string[];
+} {
+  const items = Array.isArray(immediate.content)
+    ? immediate.content
+    : [{ text: String(immediate.content || ""), offset: 0, duration: 0, lang: immediate.lang || "en" }];
+  return {
+    items,
+    lang: immediate.lang || "en",
+    availableLangs: immediate.availableLangs || [],
+  };
+}
+
 function formatTimestamp(totalSeconds: number): string {
   const seconds = Math.max(0, Math.floor(totalSeconds));
   const h = Math.floor(seconds / 3600);
@@ -123,6 +172,21 @@ function formatTimestamp(totalSeconds: number): string {
     return `${h}:${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
   }
   return `${m}:${s.toString().padStart(2, "0")}`;
+}
+
+function jsonResponse(
+  statusCode: number,
+  payload: unknown,
+  extraHeaders?: Record<string, string | number | boolean>
+) {
+  return {
+    statusCode,
+    headers: {
+      "Content-Type": "application/json",
+      ...(extraHeaders || {}),
+    } as Record<string, string | number | boolean>,
+    body: JSON.stringify(payload),
+  };
 }
 
 function isSupportedVideoUrl(input: string): boolean {
@@ -150,26 +214,7 @@ async function requestSupadata(
   const res = await fetchWithTimeout(url, { headers: { "x-api-key": apiKey } }, timeoutMs, "Supadata transcript request");
   if (res.status === 200) {
     const payload = (await res.json()) as SupadataResponsePayload;
-    // Normalize: Supadata may occasionally return a string content even when text=false.
-    if (typeof payload.content === "string") {
-      return {
-        content: payload.content,
-        lang: payload.lang || "en",
-        availableLangs: payload.availableLangs || [],
-      } as SupadataImmediate;
-    }
-    if (Array.isArray(payload.content)) {
-      return {
-        content: payload.content as SupadataChunk[],
-        lang: payload.lang || "en",
-        availableLangs: payload.availableLangs || [],
-      } as SupadataImmediate;
-    }
-    return {
-      content: [],
-      lang: payload.lang || "en",
-      availableLangs: payload.availableLangs || [],
-    } as SupadataImmediate;
+    return normalizeSupadataImmediate(payload);
   }
   if (res.status === 202) {
     const json = (await res.json()) as { jobId: string };
@@ -177,6 +222,30 @@ async function requestSupadata(
   }
   const errText = await res.text();
   throw new Error(`Supadata transcript request failed (${res.status}): ${errText}`);
+}
+
+async function getSupadataJobStatusOnce(
+  jobId: string,
+  apiKey: string,
+  opts?: { requestTimeoutMs?: number; deadlineAt?: number }
+): Promise<SupadataJobStatus> {
+  const endpoint = `https://api.supadata.ai/v1/transcript/${jobId}`;
+  const requestTimeoutMs = getEffectiveTimeoutMs(
+    opts?.requestTimeoutMs ?? 8_000,
+    "Supadata transcript polling",
+    opts?.deadlineAt
+  );
+  const res = await fetchWithTimeout(
+    endpoint,
+    { headers: { "x-api-key": apiKey } },
+    requestTimeoutMs,
+    "Supadata transcript polling"
+  );
+  if (!res.ok) {
+    const t = await res.text();
+    throw new Error(`Supadata job polling failed (${res.status}): ${t}`);
+  }
+  return (await res.json()) as SupadataJobStatus;
 }
 
 async function pollSupadataJob(
@@ -237,12 +306,14 @@ async function pollSupadataJob(
 type TranscriptAttemptRecord = {
   mode: "auto" | "native" | "generate";
   lang?: string;
-  outcome: "ok" | "job" | "empty" | "error";
+  outcome: "ok" | "job" | "pending" | "empty" | "error";
   itemCount?: number;
   returnedLang?: string;
   availableLangs?: string[];
   contentKind?: "chunks" | "text";
   errorMessage?: string;
+  jobId?: string;
+  jobStatus?: "queued" | "active" | "completed" | "failed";
 };
 
 async function getTranscriptWithFallbacks(
@@ -253,6 +324,8 @@ async function getTranscriptWithFallbacks(
     forceMode?: "auto" | "native" | "generate";
     debugAttempts?: TranscriptAttemptRecord[];
     deadlineAt?: number;
+    allowAsyncJobHandoff?: boolean;
+    supadataPollTimeoutMs?: number;
   }
 ): Promise<{ items: SupadataChunk[]; lang: string; availableLangs: string[] }> {
   const preferEnglish = opts?.preferEnglish !== false;
@@ -269,8 +342,11 @@ async function getTranscriptWithFallbacks(
       });
       let immediate: SupadataImmediate;
       if ("jobId" in first) {
-        attempts?.push({ mode, lang, outcome: "job" });
-        immediate = await pollSupadataJob(first.jobId, apiKey, 60_000, 1_500, {
+        attempts?.push({ mode, lang, outcome: "job", jobId: first.jobId, jobStatus: "queued" });
+        if (opts?.allowAsyncJobHandoff !== false) {
+          throw new SupadataJobPendingError(first.jobId, "queued");
+        }
+        immediate = await pollSupadataJob(first.jobId, apiKey, opts?.supadataPollTimeoutMs ?? 60_000, 1_000, {
           requestTimeoutMs: 10_000,
           deadlineAt: opts?.deadlineAt,
         });
@@ -278,9 +354,7 @@ async function getTranscriptWithFallbacks(
         immediate = first as SupadataImmediate;
       }
       const contentKind: "chunks" | "text" = Array.isArray(immediate.content) ? "chunks" : "text";
-      const items = Array.isArray(immediate.content)
-        ? immediate.content
-        : [{ text: String(immediate.content || ""), offset: 0, duration: 0, lang: immediate.lang || "en" }];
+      const { items } = normalizeSupadataItems(immediate);
       attempts?.push({
         mode,
         lang,
@@ -290,8 +364,12 @@ async function getTranscriptWithFallbacks(
         availableLangs: immediate.availableLangs,
         contentKind,
       });
-      return { items, lang: immediate.lang, availableLangs: immediate.availableLangs || [] };
+      return { items, lang: immediate.lang || "en", availableLangs: immediate.availableLangs || [] };
     } catch (e: unknown) {
+      if (e instanceof SupadataJobPendingError) {
+        attempts?.push({ mode, lang, outcome: "pending", jobId: e.jobId, jobStatus: e.status });
+        throw e;
+      }
       attempts?.push({ mode, lang, outcome: "error", errorMessage: getErrorMessage(e, "Transcript request failed") });
       throw e;
     }
@@ -444,96 +522,129 @@ function extractYouTubeVideoIdOptional(input: string): string | null {
 
 const handler: Handler = async (event) => {
   if (event.httpMethod !== "POST") {
-    return {
-      statusCode: 405,
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ error: "Method Not Allowed" }),
-    };
+    return jsonResponse(405, { error: "Method Not Allowed" });
   }
 
   let srcUrl: string | undefined;
   let debugFlag = false;
   let forceMode: "auto" | "native" | "generate" | undefined;
+  let suppliedJobId: string | undefined;
   const requestId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-  const overallDeadlineMs = getEnvPositiveInt("SUMMARIZE_DEADLINE_MS", 52_000);
+  const configuredDeadlineMs = getEnvPositiveInt("SUMMARIZE_DEADLINE_MS", 26_000);
+  const platformHardTimeoutMs = getEnvPositiveInt("PLATFORM_HARD_TIMEOUT_MS", 30_000);
+  const platformTimeoutSafetyMs = getEnvPositiveInt("PLATFORM_TIMEOUT_SAFETY_MS", 2_500);
+  const maxSafeDeadlineMs = Math.max(1_500, platformHardTimeoutMs - platformTimeoutSafetyMs);
+  const overallDeadlineMs = Math.min(configuredDeadlineMs, maxSafeDeadlineMs);
   const deadlineAt = Date.now() + overallDeadlineMs;
   try {
     const body = event.body ? JSON.parse(event.body) : {};
     srcUrl = body.url;
     debugFlag = Boolean(body.debug);
+    if (typeof body.jobId === "string" && body.jobId.trim()) {
+      suppliedJobId = body.jobId.trim();
+    }
     if (body.mode === "auto" || body.mode === "native" || body.mode === "generate") {
       forceMode = body.mode;
     }
   } catch {
-    return {
-      statusCode: 400,
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ error: "Invalid JSON body" }),
-    };
+    return jsonResponse(400, { error: "Invalid JSON body" });
   }
 
   if (!srcUrl || typeof srcUrl !== "string") {
-    return {
-      statusCode: 400,
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ error: "Missing 'url' in request body" }),
-    };
+    return jsonResponse(400, { error: "Missing 'url' in request body" });
   }
 
   if (!isSupportedVideoUrl(srcUrl)) {
-    return {
-      statusCode: 400,
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ error: "Please provide a supported video URL (YouTube, TikTok, Instagram)" }),
-    };
+    return jsonResponse(400, { error: "Please provide a supported video URL (YouTube, TikTok, Instagram)" });
   }
 
   const supadataApiKey = process?.env?.SUPADATA_API_KEY;
   if (!supadataApiKey) {
-    return {
-      statusCode: 500,
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        error:
-          "Missing SUPADATA_API_KEY. Set it as a Netlify environment variable or in netlify/functions/config.local.json",
-      }),
-    };
+    return jsonResponse(500, {
+      error:
+        "Missing SUPADATA_API_KEY. Set it as a Netlify environment variable or in netlify/functions/config.local.json",
+    });
   }
   const geminiApiKey = process?.env?.GEMINI_API_KEY;
   if (!geminiApiKey) {
-    return {
-      statusCode: 500,
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        error:
-          "Missing GEMINI_API_KEY. Set it as a Netlify environment variable or in netlify/functions/config.local.json",
-      }),
-    };
+    return jsonResponse(500, {
+      error:
+        "Missing GEMINI_API_KEY. Set it as a Netlify environment variable or in netlify/functions/config.local.json",
+    });
   }
 
   try {
-    console.info("summarize request started", { requestId, url: srcUrl, forceMode, overallDeadlineMs, debug: debugFlag });
+    console.info("summarize request started", {
+      requestId,
+      url: srcUrl,
+      forceMode,
+      suppliedJobId,
+      configuredDeadlineMs,
+      overallDeadlineMs,
+      platformHardTimeoutMs,
+      platformTimeoutSafetyMs,
+      debug: debugFlag,
+    });
     let requestUrl = srcUrl;
     if (/^[a-zA-Z0-9_-]{11}$/.test(srcUrl)) {
       requestUrl = `https://youtu.be/${srcUrl}`;
     }
     const debugAttempts: TranscriptAttemptRecord[] = [];
-    const { items, lang, availableLangs } = await getTranscriptWithFallbacks(requestUrl, supadataApiKey, {
-      preferEnglish: true,
-      forceMode,
-      debugAttempts,
-      deadlineAt,
-    });
+    const allowAsyncJobHandoff = process?.env?.SUPADATA_ASYNC_HANDOFF !== "false";
+    let items: SupadataChunk[] = [];
+    let lang = "en";
+    let availableLangs: string[] = [];
+    if (suppliedJobId) {
+      const job = await getSupadataJobStatusOnce(suppliedJobId, supadataApiKey, {
+        requestTimeoutMs: 8_000,
+        deadlineAt,
+      });
+      if (job.status === "failed") {
+        throw new Error(`Supadata job failed: ${JSON.stringify(job.error || {})}`);
+      }
+      if (job.status !== "completed") {
+        console.info("summarize transcript pending", { requestId, url: requestUrl, jobId: suppliedJobId, status: job.status });
+        return jsonResponse(
+          202,
+          {
+            pending: true,
+            jobId: suppliedJobId,
+            status: job.status,
+            pollAfterMs: 2_000,
+            ...(debugFlag ? { debug: { attempts: debugAttempts } } : {}),
+          },
+          { "Retry-After": "2" }
+        );
+      }
+      const normalized = normalizeSupadataItems(
+        normalizeSupadataImmediate({
+          content: job.content,
+          lang: job.lang,
+          availableLangs: job.availableLangs,
+        })
+      );
+      items = normalized.items;
+      lang = normalized.lang;
+      availableLangs = normalized.availableLangs;
+    } else {
+      const transcript = await getTranscriptWithFallbacks(requestUrl, supadataApiKey, {
+        preferEnglish: true,
+        forceMode,
+        debugAttempts,
+        deadlineAt,
+        allowAsyncJobHandoff,
+        supadataPollTimeoutMs: getEnvPositiveInt("SUPADATA_POLL_TIMEOUT_MS", 60_000),
+      });
+      items = transcript.items;
+      lang = transcript.lang;
+      availableLangs = transcript.availableLangs;
+    }
     if (!items?.length) {
       console.warn("No transcript found", { url: requestUrl, debugAttempts, lang, availableLangs });
-      return {
-        statusCode: 404,
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          error: "No transcript found for this video.",
-          ...(debugFlag ? { debug: { attempts: debugAttempts, finalLang: lang, availableLangs } } : {}),
-        }),
-      };
+      return jsonResponse(404, {
+        error: "No transcript found for this video.",
+        ...(debugFlag ? { debug: { attempts: debugAttempts, finalLang: lang, availableLangs } } : {}),
+      });
     }
 
     const transcriptText = items
@@ -570,7 +681,7 @@ Guidelines:
       : "Summarize the transcript faithfully.";
 
     const geminiTimeoutMs = getEffectiveTimeoutMs(
-      getEnvPositiveInt("GEMINI_TIMEOUT_MS", 35_000),
+      getEnvPositiveInt("GEMINI_TIMEOUT_MS", 18_000),
       "Gemini summarization",
       deadlineAt
     );
@@ -600,37 +711,39 @@ Guidelines:
 
     const maybeVideoId = extractYouTubeVideoIdOptional(srcUrl) || "";
 
-    return {
-      statusCode: 200,
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        videoId: maybeVideoId,
-        summary,
-        transcript: transcriptForResponse,
-        truncated,
-        responseTranscriptTruncated,
-        ...(debugFlag ? { debug: { attempts: debugAttempts, finalLang: lang, availableLangs } } : {}),
-      }),
-    };
+    return jsonResponse(200, {
+      videoId: maybeVideoId,
+      summary,
+      transcript: transcriptForResponse,
+      truncated,
+      responseTranscriptTruncated,
+      ...(debugFlag ? { debug: { attempts: debugAttempts, finalLang: lang, availableLangs } } : {}),
+    });
   } catch (e: unknown) {
     const message = getErrorMessage(e, "Failed to process transcript");
+    if (e instanceof SupadataJobPendingError) {
+      console.info("summarize transcript pending", { requestId, url: srcUrl, jobId: e.jobId, status: e.status });
+      return jsonResponse(
+        202,
+        {
+          pending: true,
+          jobId: e.jobId,
+          status: e.status,
+          pollAfterMs: 2_000,
+          ...(debugFlag ? { detail: message } : {}),
+        },
+        { "Retry-After": "2" }
+      );
+    }
     if (isTimeoutLikeError(e)) {
       console.error("summarize timeout", { requestId, url: srcUrl, message, error: e });
-      return {
-        statusCode: 504,
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          error: "Summarization timed out before completion. Try a shorter video or try again in a moment.",
-          ...(debugFlag ? { detail: message } : {}),
-        }),
-      };
+      return jsonResponse(504, {
+        error: "Summarization timed out before completion. Try a shorter video or try again in a moment.",
+        ...(debugFlag ? { detail: message } : {}),
+      });
     }
     console.error("summarize error", { requestId, url: srcUrl, message, error: e });
-    return {
-      statusCode: 500,
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ error: message }),
-    };
+    return jsonResponse(500, { error: message });
   }
 };
 

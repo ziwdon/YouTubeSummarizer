@@ -49,10 +49,14 @@ The summarize path is synchronous (`/api/summarize`) and can time out if transcr
 
 This function now supports tuning env vars:
 
-- `SUMMARIZE_DEADLINE_MS` (default `55000`): overall internal deadline before returning a controlled timeout.
-- `GEMINI_TIMEOUT_MS` (default `35000`): max time spent waiting for Gemini response.
+- `SUMMARIZE_DEADLINE_MS` (default `26000`): overall internal deadline before returning a controlled timeout.
+- `GEMINI_TIMEOUT_MS` (default `18000`): max time spent waiting for Gemini response.
 - `MAX_TRANSCRIPT_MODEL_CHARS` (default `60000`): transcript size sent to Gemini.
 - `MAX_TRANSCRIPT_RESPONSE_CHARS` (default `120000`): transcript size returned to the browser.
+- `PLATFORM_HARD_TIMEOUT_MS` (default `30000`): hard platform timeout (Netlify sync function wall-clock limit on free tier).
+- `PLATFORM_TIMEOUT_SAFETY_MS` (default `2500`): safety margin subtracted from hard timeout.
+- `SUPADATA_ASYNC_HANDOFF` (default `true`): when true, return `202 { pending: true, jobId }` and let the client poll.
+- `SUPADATA_POLL_TIMEOUT_MS` (default `60000`): used only when async handoff is disabled.
 
 If you still see 502/504:
 - Check function logs for `summarize request started`, `summarize transcript ready`, and `summarize timeout` entries.
@@ -62,10 +66,13 @@ If you still see 502/504:
 
 ### Recommended Netlify values
 
-Netlify synchronous functions currently have a 60s execution limit. To leave a small safety margin, start with:
+Netlify synchronous functions on free tier can be terminated around 30s wall-clock. To avoid platform-killed 504s, keep app-level deadlines comfortably below this:
 
-- `SUMMARIZE_DEADLINE_MS=55000`
-- `GEMINI_TIMEOUT_MS=35000`
+- `SUMMARIZE_DEADLINE_MS=26000`
+- `GEMINI_TIMEOUT_MS=18000`
 - `MAX_TRANSCRIPT_MODEL_CHARS=60000` (raise to `90000` only if needed)
+- `PLATFORM_HARD_TIMEOUT_MS=30000`
+- `PLATFORM_TIMEOUT_SAFETY_MS=2500`
+- `SUPADATA_ASYNC_HANDOFF=true`
 
-If timeouts persist, inspect the debug logs first before increasing transcript size caps.
+For videos where Supadata returns async jobs (common with long videos or AI-generated transcripts), the UI now polls using `jobId` until ready, so transcript processing can continue across multiple short Netlify requests.
