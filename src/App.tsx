@@ -8,6 +8,14 @@ type ApiResponse = {
   truncated?: boolean
 }
 
+type ApiPendingResponse = {
+  pending: true
+  jobId: string
+  status?: 'queued' | 'active'
+  pollAfterMs?: number
+  error?: string
+}
+
 type NavigatorWithShare = Navigator & {
   share: (data?: ShareData) => Promise<void>
 }
@@ -80,6 +88,7 @@ function App() {
   }, [isSubmitting, LOADING_STEPS.length])
 
   const isValid = useMemo(() => !!isSupportedVideoUrl(url), [url])
+  const MAX_POLLING_WAIT_MS = 4 * 60 * 1000
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault()
@@ -91,17 +100,39 @@ function App() {
     }
     setIsSubmitting(true)
     try {
-      const res = await fetch(`${API_BASE}/summarize`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url }),
-      })
-      if (!res.ok) {
-        const msg = await res.json().catch(() => ({}))
-        throw new Error(msg.error || `Request failed (${res.status})`)
+      const startedAt = Date.now()
+      let jobId: string | null = null
+      while (true) {
+        const requestBody = jobId ? { url, jobId } : { url }
+        const res = await fetch(`${API_BASE}/summarize`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(requestBody),
+        })
+        const payload = await res.json().catch(() => ({}))
+
+        if (res.status === 202 && payload?.pending) {
+          const pending = payload as ApiPendingResponse
+          if (!pending.jobId) {
+            throw new Error('Transcript job was pending, but no jobId was returned.')
+          }
+          jobId = pending.jobId
+          if (Date.now() - startedAt > MAX_POLLING_WAIT_MS) {
+            throw new Error('Transcript is taking too long to process. Please try a shorter video.')
+          }
+          const pollAfterMs = Math.max(500, Number(pending.pollAfterMs) || 2000)
+          await new Promise((resolve) => setTimeout(resolve, pollAfterMs))
+          continue
+        }
+
+        if (!res.ok) {
+          throw new Error(payload.error || `Request failed (${res.status})`)
+        }
+
+        const json: ApiResponse = payload
+        setData(json)
+        break
       }
-      const json: ApiResponse = await res.json()
-      setData(json)
     } catch (err: unknown) {
       setError(getErrorMessage(err, 'Failed to summarize video'))
     } finally {
